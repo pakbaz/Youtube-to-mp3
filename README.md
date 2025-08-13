@@ -24,6 +24,15 @@ A robust YouTube to MP3 converter with intelligent format fallbacks and enhanced
      - **macOS:** `brew install ffmpeg`
      - **Windows (one of):** `winget install Gyan.FFmpeg` or `choco install ffmpeg` or `scoop install ffmpeg`
      - **Ubuntu/Debian:** `sudo apt-get update && sudo apt-get install ffmpeg`
+    
+3. **Install Env:**
+   ```bash
+   # Create venv in a hidden folder .venv
+   python3 -m venv .venv
+   
+   # Activate it
+   source .venv/bin/activate
+   ```
 
 ## Usage
 
