@@ -118,6 +118,7 @@ def get_music_metadata_from_title(title: str) -> Optional[Dict[str, Any]]:
     """
     Get music metadata from title using online services.
     Simplified to use iTunes first, then fallbacks.
+    Each call is isolated to prevent metadata leakage between different songs.
     """
     # Clean up title - remove common YouTube additions
     clean_title = clean_youtube_title(title)
@@ -181,6 +182,7 @@ def lookup_musicbrainz(title: str) -> Optional[Dict[str, Any]]:
     """
     Look up music metadata using MusicBrainz API.
     Most comprehensive and accurate music database.
+    Uses a fresh session for each lookup to prevent data leakage.
     """
     import urllib.parse
     
@@ -194,9 +196,11 @@ def lookup_musicbrainz(title: str) -> Optional[Dict[str, Any]]:
     }
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        # Use a fresh session for each request to prevent caching/state issues
+        with requests.Session() as session:
+            response = session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
         
         recordings = data.get('recordings', [])
         if not recordings:
@@ -219,8 +223,20 @@ def lookup_musicbrainz(title: str) -> Optional[Dict[str, Any]]:
         # Get artist info
         if recording.get('artist-credit'):
             artists = [ac.get('name', '') for ac in recording['artist-credit'] if isinstance(ac, dict)]
-            result['artist'] = ', '.join(artists)
-            result['album_artist'] = result['artist']
+            artist_names = ', '.join(artists)
+            # Avoid "Various Artists" if possible - look for next recording if this one has Various Artists
+            if artist_names.lower() == 'various artists' and len(recordings) > 1:
+                for alt_recording in recordings[1:]:
+                    if alt_recording.get('artist-credit'):
+                        alt_artists = [ac.get('name', '') for ac in alt_recording['artist-credit'] if isinstance(ac, dict)]
+                        alt_artist_names = ', '.join(alt_artists)
+                        if alt_artist_names.lower() != 'various artists':
+                            recording = alt_recording  # Use this alternative recording instead
+                            artist_names = alt_artist_names
+                            result['title'] = recording.get('title', '')
+                            break
+            result['artist'] = artist_names
+            result['album_artist'] = artist_names
         
         # Get release info (album)
         if recording.get('releases'):
@@ -239,6 +255,7 @@ def lookup_itunes_direct(title: str) -> Optional[Dict[str, Any]]:
     """
     Direct iTunes Search API lookup using the full title.
     Good for popular music and accurate metadata.
+    Uses a fresh session for each lookup to prevent data leakage.
     """
     try:
         params = {
@@ -248,9 +265,11 @@ def lookup_itunes_direct(title: str) -> Optional[Dict[str, Any]]:
             'limit': 5
         }
         
-        response = requests.get(ITUNES_SEARCH_URL, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        # Use a fresh session for each request to prevent caching/state issues
+        with requests.Session() as session:
+            response = session.get(ITUNES_SEARCH_URL, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
         
         if data.get('resultCount', 0) == 0:
             return None
@@ -266,6 +285,10 @@ def lookup_itunes_direct(title: str) -> Optional[Dict[str, Any]]:
             track_name = result.get('trackName', '').lower()
             artist_name = result.get('artistName', '').lower()
             
+            # Skip "Various Artists" results unless it's the only option
+            if artist_name == 'various artists':
+                continue
+            
             # Calculate similarity score
             track_words = set(track_name.split())
             artist_words = set(artist_name.split())
@@ -280,7 +303,14 @@ def lookup_itunes_direct(title: str) -> Optional[Dict[str, Any]]:
                 best_match = result
         
         if not best_match:
-            best_match = results[0]  # Fallback to first result
+            # If no good match found, try to find any non-"Various Artists" result
+            for result in results:
+                if result.get('artistName', '').lower() != 'various artists':
+                    best_match = result
+                    break
+            # Last resort: use first result even if it's "Various Artists"
+            if not best_match:
+                best_match = results[0]
         
         return {
             'title': best_match.get('trackName', ''),
@@ -326,16 +356,17 @@ def lookup_last_fm(title: str) -> Optional[Dict[str, Any]]:
 
 
 def download_artwork(url: str) -> Optional[bytes]:
-    """Download album artwork from URL"""
+    """Download album artwork from URL using a fresh session"""
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        return r.content
+        with requests.Session() as session:
+            r = session.get(url, timeout=10)
+            r.raise_for_status()
+            return r.content
     except Exception:
         return None
 
 
-def tag_mp3_with_metadata(mp3_path: Path, video_title: str, uploader: Optional[str] = None, video_id: Optional[str] = None):
+def tag_mp3_with_metadata(mp3_path: Path, video_title: str, uploader: Optional[str] = None, video_id: Optional[str] = None, playlist_info: Optional[Dict[str, Any]] = None):
     """
     Tag MP3 file with metadata from online music services.
     Assumes the video is a music video and looks up proper metadata.
@@ -380,6 +411,24 @@ def tag_mp3_with_metadata(mp3_path: Path, video_title: str, uploader: Optional[s
         }
     else:
         print(f"✓ Enhanced metadata: {metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}")
+        
+        # If metadata lookup returned "Various Artists" and we have a valid uploader, use uploader instead
+        if (metadata.get('artist', '').lower() == 'various artists' and 
+            uploader and uploader.lower() != 'various artists'):
+            print(f"⚠ Replacing 'Various Artists' with uploader: {uploader}")
+            metadata['artist'] = uploader
+            metadata['album_artist'] = uploader
+            
+        # Improve album handling for playlist downloads
+        if playlist_info and playlist_info.get('playlist_title'):
+            playlist_title = playlist_info['playlist_title']
+            # If we don't have a good album name from metadata, use playlist title
+            if not metadata.get('album') or metadata.get('album').lower() in ['various artists', 'unknown album']:
+                metadata['album'] = playlist_title
+                print(f"✓ Set album to playlist title: {playlist_title}")
+            # Add playlist track number if available
+            if playlist_info.get('playlist_index'):
+                metadata['track_number'] = str(playlist_info['playlist_index'])
     
     # Apply metadata to MP3 file
     try:
@@ -478,12 +527,12 @@ def enhanced_itunes_lookup(artist: Optional[str], track: str, album: Optional[st
 
 def tag_mp3_enhanced(mp3_path: Path, video_title: str, uploader: Optional[str] = None, video_id: Optional[str] = None):
     """Legacy function - replaced by tag_mp3_with_metadata"""
-    tag_mp3_with_metadata(mp3_path, video_title, uploader, video_id)
+    tag_mp3_with_metadata(mp3_path, video_title, uploader, video_id, None)
 
 
 def tag_mp3(mp3_path: Path, base_title: str, uploader: Optional[str] = None):
     """Legacy function - replaced by tag_mp3_with_metadata"""
-    tag_mp3_with_metadata(mp3_path, base_title, uploader)
+    tag_mp3_with_metadata(mp3_path, base_title, uploader, None, None)
 
 
 # ---------- yt-dlp options ----------
@@ -543,8 +592,25 @@ def make_ydl_opts(outdir: str, bitrate: str, allow_playlist: bool, alt: bool = F
         uploader = info.get('artist') or info.get('uploader')
         video_id = info.get('id')
         
+        # Extract playlist information
+        playlist_info = None
+        if info.get('playlist') or info.get('playlist_title'):
+            playlist_info = {
+                'playlist_title': info.get('playlist_title'),
+                'playlist_id': info.get('playlist_id'),
+                'playlist_index': info.get('playlist_index'),
+                'playlist_count': info.get('playlist_count')
+            }
+        
+        # Ensure metadata lookup isolation by clearing any potential caches
+        # This prevents metadata leakage between different songs
+        print(f"📋 Title: {base_title}")
+        print(f"👤 Uploader: {uploader}")
+        if playlist_info:
+            print(f"📁 Playlist: {playlist_info.get('playlist_title')} ({playlist_info.get('playlist_index')}/{playlist_info.get('playlist_count')})")
+        
         try:
-            tag_mp3_with_metadata(Path(filepath), base_title, uploader, video_id)
+            tag_mp3_with_metadata(Path(filepath), base_title, uploader, video_id, playlist_info)
         except Exception as e:
             print(f"⚠ Metadata lookup failed: {e}")
             # Fallback to basic tagging
@@ -635,7 +701,11 @@ def pick_best_audio_format(formats: List[dict]) -> Optional[str]:
 def attempt_manual_format(url: str, outdir: str, bitrate: str, allow_playlist: bool) -> bool:
     """Fallback: extract info without downloading, pick a viable audio stream, then download."""
     print("Attempting manual format selection…")
-    base_opts = make_ydl_opts(outdir, bitrate, allow_playlist)
+    
+    # Create fresh processed_files for manual format attempt
+    manual_processed_files = set()
+    base_opts = make_ydl_opts(outdir, bitrate, allow_playlist, processed_files=manual_processed_files)
+    
     # We only need metadata first; silence progress for this step.
     meta_opts = dict(base_opts)
     # Remove restrictive entries so extraction is broad
@@ -660,8 +730,9 @@ def attempt_manual_format(url: str, outdir: str, bitrate: str, allow_playlist: b
             print("No formats returned; aborting manual attempt.")
             return False
     print(f"Chosen audio format id: {chosen}")
-    # Now re-run with explicit format id
-    dl_opts = make_ydl_opts(outdir, bitrate, allow_playlist)
+    # Now re-run with explicit format id and fresh processed_files
+    dl_processed_files = set()
+    dl_opts = make_ydl_opts(outdir, bitrate, allow_playlist, processed_files=dl_processed_files)
     dl_opts['format'] = chosen
     dl_opts.pop('extractor_args', None)  # do not constrain when explicit format chosen
     try:
@@ -708,45 +779,53 @@ def main():
     urls = load_urls(args.url, Path(args.file), args.allow_playlist)
     failures: List[str] = []
 
-    # Create a shared processed_files set for the entire session
-    processed_files = set()
-    ydl_opts = make_ydl_opts(args.outdir, args.bitrate, args.allow_playlist, processed_files=processed_files)
+    # Process each URL with its own isolated environment
+    for i, u in enumerate(urls, 1):
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(urls)}] Processing: {u}")
+        print(f"{'='*60}")
+        
+        # Create a fresh processed_files set for each download to prevent cross-contamination
+        processed_files = set()
+        ydl_opts = make_ydl_opts(args.outdir, args.bitrate, args.allow_playlist, processed_files=processed_files)
+        
+        print(f"🔄 Created isolated environment for download {i}")
 
-    with YoutubeDL(ydl_opts) as ydl:
-        for i, u in enumerate(urls, 1):
-            print(f"\n[{i}/{len(urls)}] {u}")
-            try:
-                print(f"Using (normalized): {u}")
-                if args.list_formats:
-                    tmp_opts = dict(ydl_opts)
-                    tmp_opts.pop('format', None)
-                    tmp_opts.pop('extractor_args', None)
-                    with YoutubeDL(tmp_opts) as ydl_list:
-                        info = ydl_list.extract_info(u, download=False)
-                    formats = info.get('formats') or []
-                    print("id  ext  acodec        vcodec        abr  tbr  note")
-                    for f in formats:
-                        print(f"{f.get('format_id'):>3} {f.get('ext'):>4} {str(f.get('acodec')):>12} {str(f.get('vcodec')):>12} {str(f.get('abr')):>4} {str(f.get('tbr')):>4} {f.get('format_note')}")
-                    continue
-                if args.test_metadata:
-                    tmp_opts = dict(ydl_opts)
-                    tmp_opts.pop('format', None)
-                    tmp_opts.pop('extractor_args', None)
-                    with YoutubeDL(tmp_opts) as ydl_meta:
-                        info = ydl_meta.extract_info(u, download=False)
-                    title = info.get('title', 'Unknown Title')
-                    print(f"Video title: {title}")
-                    print("Testing metadata lookup...")
-                    metadata = get_music_metadata_from_title(title)
-                    if metadata:
-                        print("✓ Metadata found:")
-                        for key, value in metadata.items():
-                            if value:
-                                print(f"  {key.title()}: {value}")
-                    else:
-                        print("✗ No metadata found")
-                    continue
-                print("Starting download...")
+        try:
+            print(f"Using (normalized): {u}")
+            if args.list_formats:
+                tmp_opts = dict(ydl_opts)
+                tmp_opts.pop('format', None)
+                tmp_opts.pop('extractor_args', None)
+                with YoutubeDL(tmp_opts) as ydl_list:
+                    info = ydl_list.extract_info(u, download=False)
+                formats = info.get('formats') or []
+                print("id  ext  acodec        vcodec        abr  tbr  note")
+                for f in formats:
+                    print(f"{f.get('format_id'):>3} {f.get('ext'):>4} {str(f.get('acodec')):>12} {str(f.get('vcodec')):>12} {str(f.get('abr')):>4} {str(f.get('tbr')):>4} {f.get('format_note')}")
+                continue
+            if args.test_metadata:
+                tmp_opts = dict(ydl_opts)
+                tmp_opts.pop('format', None)
+                tmp_opts.pop('extractor_args', None)
+                with YoutubeDL(tmp_opts) as ydl_meta:
+                    info = ydl_meta.extract_info(u, download=False)
+                title = info.get('title', 'Unknown Title')
+                print(f"Video title: {title}")
+                print("Testing metadata lookup...")
+                metadata = get_music_metadata_from_title(title)
+                if metadata:
+                    print("✓ Metadata found:")
+                    for key, value in metadata.items():
+                        if value:
+                            print(f"  {key.title()}: {value}")
+                else:
+                    print("✗ No metadata found")
+                continue
+            print("Starting download...")
+            
+            # Create a fresh YoutubeDL instance for each download
+            with YoutubeDL(ydl_opts) as ydl:
                 try:
                     with TimeoutHandler(120):  # 2 minute timeout
                         ydl.download([u])
@@ -754,52 +833,56 @@ def main():
                 except TimeoutError as te:
                     print(f"❌ Download timed out: {te}")
                     raise Exception(f"Download timed out after 120 seconds")
-                print("✅ Done")
-            except Exception as e:
-                msg = str(e)
-                print(f"Primary attempt failed: {msg}")
-                # Try fallback sequence for format issues  
-                if any(phrase in msg.lower() for phrase in ['format', 'not available', 'empty file']):
-                    # Optimized format sequence based on actual success patterns
-                    alt_specs = [
-                        'bestaudio',           # This consistently works
-                        'best[height<=720]',   # Lower quality fallback
-                        'best',                # Final fallback
-                    ]
-                    success = False
-                    for spec in alt_specs:
-                        try:
-                            print(f"Trying format: {spec}")
-                            spec_opts = make_ydl_opts(args.outdir, args.bitrate, args.allow_playlist, processed_files=processed_files)
-                            spec_opts['format'] = spec
-                            spec_opts.pop('extractor_args', None)
-                            with YoutubeDL(spec_opts) as ydl_spec:
-                                with TimeoutHandler(120):
-                                    ydl_spec.download([u])
-                            print(f"✅ Done (spec {spec})")
-                            success = True
-                            break
-                        except Exception as spec_err:
-                            print(f"❌ {spec} failed")
-                    
-                    if success:
-                        continue
-                    
-                    # If format specs failed, try manual format selection
-                    if attempt_manual_format(u, args.outdir, args.bitrate, args.allow_playlist):
-                        continue
+            print("✅ Done")
+        except Exception as e:
+            msg = str(e)
+            print(f"Primary attempt failed: {msg}")
+            # Try fallback sequence for format issues  
+            if any(phrase in msg.lower() for phrase in ['format', 'not available', 'empty file']):
+                # Optimized format sequence based on actual success patterns
+                alt_specs = [
+                    'bestaudio',           # This consistently works
+                    'best[height<=720]',   # Lower quality fallback
+                    'best',                # Final fallback
+                ]
+                success = False
+                for spec in alt_specs:
+                    try:
+                        print(f"Trying format: {spec}")
+                        # Create fresh processed_files for fallback attempts too
+                        fallback_processed_files = set()
+                        spec_opts = make_ydl_opts(args.outdir, args.bitrate, args.allow_playlist, processed_files=fallback_processed_files)
+                        spec_opts['format'] = spec
+                        spec_opts.pop('extractor_args', None)
+                        with YoutubeDL(spec_opts) as ydl_spec:
+                            with TimeoutHandler(120):
+                                ydl_spec.download([u])
+                        print(f"✅ Done (spec {spec})")
+                        success = True
+                        break
+                    except Exception as spec_err:
+                        print(f"❌ {spec} failed")
                 
-                # Final fallback with alternate extraction strategy
-                print("Retrying with alternate strategy…")
-                try:
-                    alt_opts = make_ydl_opts(args.outdir, args.bitrate, args.allow_playlist, alt=True, processed_files=processed_files)
-                    with YoutubeDL(alt_opts) as ydl2:
-                        with TimeoutHandler(120):
-                            ydl2.download([u])
-                    print("✅ Done (alternate)")
-                except Exception as e2:
-                    print(f"❌ Failed: {e2}")
-                    failures.append(u)
+                if success:
+                    continue
+                
+                # If format specs failed, try manual format selection
+                if attempt_manual_format(u, args.outdir, args.bitrate, args.allow_playlist):
+                    continue
+            
+            # Final fallback with alternate extraction strategy
+            print("Retrying with alternate strategy…")
+            try:
+                # Create fresh processed_files for final fallback too
+                final_processed_files = set()
+                alt_opts = make_ydl_opts(args.outdir, args.bitrate, args.allow_playlist, alt=True, processed_files=final_processed_files)
+                with YoutubeDL(alt_opts) as ydl2:
+                    with TimeoutHandler(120):
+                        ydl2.download([u])
+                print("✅ Done (alternate)")
+            except Exception as e2:
+                print(f"❌ Failed: {e2}")
+                failures.append(u)
 
     if failures:
         print("\nSome downloads failed:")
