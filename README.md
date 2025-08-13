@@ -15,8 +15,13 @@ A robust YouTube to MP3 converter with intelligent format fallbacks and enhanced
 ## Quick start (macOS/Windows/Linux):
 
 1. **Install Python 3.8+** (if you don't have it).
-
-2. **Install the tools:**
+2. **Create Alias for pip and python**
+  ```bash
+   echo 'alias python=python3' >> ~/.zshrc
+   echo 'alias pip=pip3' >> ~/.zshrc                            
+   source ~/.zshrc
+  ```
+3. **Install the tools:**
    ```bash
    pip install yt-dlp mutagen requests
    ```
@@ -25,7 +30,7 @@ A robust YouTube to MP3 converter with intelligent format fallbacks and enhanced
      - **Windows (one of):** `winget install Gyan.FFmpeg` or `choco install ffmpeg` or `scoop install ffmpeg`
      - **Ubuntu/Debian:** `sudo apt-get update && sudo apt-get install ffmpeg`
     
-3. **Install Env:**
+4. **Install Env:**
    ```bash
    # Create venv in a hidden folder .venv
    python3 -m venv .venv
@@ -33,7 +38,10 @@ A robust YouTube to MP3 converter with intelligent format fallbacks and enhanced
    # Activate it
    source .venv/bin/activate
    ```
-
+5. **Install Requirements:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 ## Usage
 
 - **Single video:** `python run.py <YouTube_URL>`
