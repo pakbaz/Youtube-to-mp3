@@ -12,6 +12,51 @@ A robust YouTube to MP3 converter with intelligent format fallbacks and enhanced
 - **Timeout Protection**: Prevents hanging with configurable timeouts
 - **Playlist Filtering**: Strips playlist parameters by default (unless --allow-playlist)
 
+## Getting Started
+
+### Prerequisites
+- **Python 3.8+** - [Download from python.org](https://www.python.org/downloads/)
+- **FFmpeg** - Required for audio conversion
+
+### Setup Instructions
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/pakbaz/Youtube-to-mp3.git
+   cd Youtube-to-mp3
+   ```
+
+2. **Create a virtual environment (recommended):**
+   ```bash
+   python -m venv venv
+   ```
+
+3. **Activate the virtual environment:**
+   - **Windows:**
+     ```bash
+     venv\Scripts\activate
+     ```
+   - **macOS/Linux:**
+     ```bash
+     source venv/bin/activate
+     ```
+
+4. **Install Python dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+5. **Install FFmpeg:**
+   - **macOS:** `brew install ffmpeg`
+   - **Windows (one of):** `winget install Gyan.FFmpeg` or `choco install ffmpeg` or `scoop install ffmpeg`
+   - **Ubuntu/Debian:** `sudo apt-get update && sudo apt-get install ffmpeg`
+
+### Verify Installation
+Test the setup by running:
+```bash
+python run.py --help
+```
+
 ## Quick start (macOS/Windows/Linux):
 
 1. **Install Python 3.8+** (if you don't have it).
