@@ -17,9 +17,15 @@ import sys
 import shutil
 import re
 import signal
+import difflib
+import threading
+try:
+    from threading import interrupt_main as _interrupt_main
+except ImportError:
+    from _thread import interrupt_main as _interrupt_main
 import unicodedata
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, NamedTuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
@@ -34,6 +40,24 @@ DEFAULT_OUTDIR = SCRIPT_DIR / "downloads"
 DEFAULT_LISTFILE = SCRIPT_DIR / "download.txt"
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 
+
+# Ensure console output works across limited encodings (e.g., Windows cp1252).
+_ORIGINAL_PRINT = print
+
+def print(*args, **kwargs):
+    """Emit console output even when the active code page lacks some glyphs."""
+    file = kwargs.get("file", sys.stdout)
+    encoding = getattr(file, "encoding", None) or "utf-8"
+    safe_args = []
+    for arg in args:
+        if isinstance(arg, str):
+            try:
+                safe_args.append(arg.encode(encoding, errors="replace").decode(encoding))
+            except LookupError:
+                safe_args.append(arg.encode("utf-8", errors="replace").decode("utf-8"))
+        else:
+            safe_args.append(arg)
+    _ORIGINAL_PRINT(*safe_args, **kwargs)
 
 def normalize_unicode_text(text: str) -> str:
     """
@@ -54,19 +78,38 @@ def normalize_unicode_text(text: str) -> str:
 class TimeoutHandler:
     def __init__(self, timeout_seconds=120):
         self.timeout_seconds = timeout_seconds
+        self._has_sigalrm = hasattr(signal, "SIGALRM")
         self.old_handler = None
-    
+        self._timer = None
+        self._triggered = False
+
     def __enter__(self):
-        def timeout_handler(signum, frame):
-            raise TimeoutError(f"Operation timed out after {self.timeout_seconds} seconds")
-        self.old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(self.timeout_seconds)
+        if self._has_sigalrm:
+            def timeout_handler(signum, frame):
+                raise TimeoutError(f"Operation timed out after {self.timeout_seconds} seconds")
+            self.old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(self.timeout_seconds)
+        else:
+            # Fallback for platforms (e.g., Windows) without SIGALRM support
+            def trigger():
+                self._triggered = True
+                _interrupt_main()
+            self._timer = threading.Timer(self.timeout_seconds, trigger)
+            self._timer.daemon = True
+            self._timer.start()
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        signal.alarm(0)
-        if self.old_handler:
-            signal.signal(signal.SIGALRM, self.old_handler)
+        if self._has_sigalrm:
+            signal.alarm(0)
+            if self.old_handler:
+                signal.signal(signal.SIGALRM, self.old_handler)
+        else:
+            if self._timer:
+                self._timer.cancel()
+            if exc_type is KeyboardInterrupt and self._triggered:
+                raise TimeoutError(f"Operation timed out after {self.timeout_seconds} seconds") from None
+        return False
 
 
 def progress_hook(d):
@@ -114,53 +157,18 @@ def normalize_url(u: str, allow_playlist: bool) -> str:
 
 
 # ---------- Enhanced Metadata helpers ----------
-def get_music_metadata_from_title(title: str) -> Optional[Dict[str, Any]]:
-    """
-    Get music metadata from title using online services.
-    Simplified to use iTunes first, then fallbacks.
-    Each call is isolated to prevent metadata leakage between different songs.
-    """
-    # Clean up title - remove common YouTube additions
-    clean_title = clean_youtube_title(title)
-    
-    print(f"Looking up metadata for: '{clean_title}'")
-    
-    # Try iTunes first (most reliable and fast)
-    try:
-        result = lookup_itunes_direct(clean_title)
-        if result and result.get('title'):
-            print(f"✓ Metadata found via iTunes")
-            return result
-    except Exception as e:
-        print(f"⚠ iTunes lookup failed: {e}")
-    
-    # Try MusicBrainz as fallback
-    try:
-        result = lookup_musicbrainz(clean_title)
-        if result and result.get('title'):
-            print(f"✓ Metadata found via MusicBrainz")
-            return result
-    except Exception as e:
-        print(f"⚠ MusicBrainz lookup failed: {e}")
-    
-    print("✗ No metadata found from any service")
-    return None
-
-
 def clean_youtube_title(title: str) -> str:
-    """
-    Clean YouTube title by removing common additions and noise.
-    Preserves Unicode characters for Persian and other international content.
-    """
-    # Normalize Unicode text first
+    '''Clean YouTube title by removing common additions and noise.'''
     title = normalize_unicode_text(title)
-    
-    # Remove common YouTube suffixes while preserving Unicode content
     patterns_to_remove = [
         r'\s*\(Official Video\).*$',
         r'\s*\(Official Music Video\).*$',
         r'\s*\(Official Audio\).*$',
+        r'\s*\(Official Visualizer\).*$',
+        r'\s*\(Visualizer\).*$',
         r'\s*\(Lyric Video\).*$',
+        r'\s*\(Lyrics\).*$',
+        r'\s*\[Lyrics\].*$',
         r'\s*\(Live\).*$',
         r'\s*\(HD\).*$',
         r'\s*\(4K\).*$',
@@ -170,164 +178,519 @@ def clean_youtube_title(title: str) -> str:
         r'\s*- Topic$',
         r'\s*VEVO$',
     ]
-    
     cleaned = title
     for pattern in patterns_to_remove:
         cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-    
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned)
     return cleaned.strip()
 
 
-def lookup_musicbrainz(title: str) -> Optional[Dict[str, Any]]:
-    """
-    Look up music metadata using MusicBrainz API.
-    Most comprehensive and accurate music database.
-    Uses a fresh session for each lookup to prevent data leakage.
-    """
-    import urllib.parse
-    
-    # MusicBrainz search API
-    base_url = "https://musicbrainz.org/ws/2/recording"
-    query = urllib.parse.quote(title)
-    url = f"{base_url}?query={query}&fmt=json&limit=5"
-    
-    headers = {
-        'User-Agent': 'YoutubeMp3Converter/1.0 (your-email@example.com)'  # Required by MusicBrainz
-    }
-    
-    try:
-        # Use a fresh session for each request to prevent caching/state issues
-        with requests.Session() as session:
-            response = session.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-        
-        recordings = data.get('recordings', [])
-        if not recordings:
-            return None
-        
-        # Get the best match (first result is usually most relevant)
-        recording = recordings[0]
-        
-        # Extract metadata
-        result = {
-            'title': recording.get('title', ''),
-            'artist': '',
-            'album': '',
-            'date': '',
-            'genre': '',
-            'track_number': '',
-            'album_artist': '',
-        }
-        
-        # Get artist info
-        if recording.get('artist-credit'):
-            artists = [ac.get('name', '') for ac in recording['artist-credit'] if isinstance(ac, dict)]
-            artist_names = ', '.join(artists)
-            # Avoid "Various Artists" if possible - look for next recording if this one has Various Artists
-            if artist_names.lower() == 'various artists' and len(recordings) > 1:
-                for alt_recording in recordings[1:]:
-                    if alt_recording.get('artist-credit'):
-                        alt_artists = [ac.get('name', '') for ac in alt_recording['artist-credit'] if isinstance(ac, dict)]
-                        alt_artist_names = ', '.join(alt_artists)
-                        if alt_artist_names.lower() != 'various artists':
-                            recording = alt_recording  # Use this alternative recording instead
-                            artist_names = alt_artist_names
-                            result['title'] = recording.get('title', '')
-                            break
-            result['artist'] = artist_names
-            result['album_artist'] = artist_names
-        
-        # Get release info (album)
-        if recording.get('releases'):
-            release = recording['releases'][0]
-            result['album'] = release.get('title', '')
-            result['date'] = release.get('date', '')[:4] if release.get('date') else ''
-        
-        return result if result['title'] and result['artist'] else None
-        
-    except Exception as e:
-        print(f"MusicBrainz lookup error: {e}")
+class MetadataCandidate(NamedTuple):
+    track: str
+    artist: Optional[str]
+    query: str
+
+
+def _strip_featuring(text: Optional[str]) -> str:
+    if not text:
+        return ''
+    cleaned = re.sub(r'\s*\((?:feat\.?|ft\.?|featuring) [^)]*\)', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+(?:feat\.?|ft\.?|featuring) .+$', '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _normalize_artist_name(name: Optional[str]) -> str:
+    if not name:
+        return ''
+    result = normalize_unicode_text(name)
+    result = re.sub(r'\s*-\s*Topic$', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'\s*VEVO$', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'\s*Official$', '', result, flags=re.IGNORECASE)
+    return result.strip()
+
+
+def _string_similarity(a: Optional[str], b: Optional[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _build_metadata_candidates(title: str, uploader: Optional[str] = None) -> List[MetadataCandidate]:
+    clean_title = clean_youtube_title(title)
+    base_track = _strip_featuring(clean_title)
+    uploader_name = _strip_featuring(_normalize_artist_name(uploader))
+
+    candidates: List[MetadataCandidate] = []
+    seen = set()
+
+
+    def add_candidate(track: str, artist: Optional[str]) -> None:
+        artist_value = _strip_featuring(normalize_unicode_text(artist or '').strip()) if artist else None
+
+        def push_variant(raw_track: str) -> None:
+            track_value = _strip_featuring(normalize_unicode_text(raw_track or '').strip())
+            if not track_value:
+                return
+            key = (track_value.lower(), artist_value.lower() if artist_value else None)
+            if key in seen:
+                return
+            seen.add(key)
+            query_parts = [artist_value, track_value] if artist_value else [track_value]
+            query = ' '.join(part for part in query_parts if part)
+            candidates.append(MetadataCandidate(track=track_value, artist=artist_value, query=query))
+
+        push_variant(track)
+
+        if track:
+            for delim in ['|', '/', ' - ', ' \u2013 ', ' \u2014 ']:
+                if delim in track:
+                    push_variant(track.split(delim, 1)[0])
+            no_paren = re.sub(r'\s*\([^)]*\)\s*$', '', track).strip()
+            if no_paren and no_paren != track:
+                push_variant(no_paren)
+    for sep in [' - ', ' \u2013 ', ' \u2014 ', ' | ']:
+        if sep in clean_title:
+            left, right = [part.strip() for part in clean_title.split(sep, 1)]
+            add_candidate(right, left)
+            break
+
+    lower_clean = clean_title.lower()
+    if ' by ' in lower_clean:
+        parts = re.split(r'\s+by\s+', clean_title, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            add_candidate(parts[0], parts[1])
+
+    if uploader_name:
+        add_candidate(base_track, uploader_name)
+        if ' - ' in uploader_name:
+            add_candidate(base_track, uploader_name.split(' - ', 1)[0].strip())
+
+    add_candidate(base_track, None)
+    if base_track != clean_title:
+        add_candidate(clean_title, None)
+
+    if not candidates:
+        add_candidate(clean_title or title, uploader_name if uploader_name else None)
+
+    return candidates
+
+
+
+def _sanitize_metadata_result(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for key, value in metadata.items():
+        if isinstance(value, str):
+            cleaned = normalize_unicode_text(value).strip()
+            sanitized[key] = cleaned
+        else:
+            sanitized[key] = value
+    if sanitized.get('artist') and not sanitized.get('album_artist'):
+        sanitized['album_artist'] = sanitized['artist']
+    if sanitized.get('artist') and sanitized.get('album_artist'):
+        artist_lower = sanitized['artist'].lower()
+        album_artist_lower = sanitized['album_artist'].lower()
+        if album_artist_lower == 'various artists' and artist_lower != 'various artists':
+            sanitized['album_artist'] = sanitized['artist']
+    return sanitized
+
+
+def get_music_metadata_from_title(title: str, uploader: Optional[str] = None, video_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not title:
         return None
 
+    candidates = _build_metadata_candidates(title, uploader)
+    lookup_chain = [
+        ('AudioDB', lookup_audiodb),
+        ('Deezer', lookup_deezer),
+        ('MusicBrainz', lookup_musicbrainz),
+        ('iTunes', lookup_itunes_direct),
+    ]
 
-def lookup_itunes_direct(title: str) -> Optional[Dict[str, Any]]:
-    """
-    Direct iTunes Search API lookup using the full title.
-    Good for popular music and accurate metadata.
-    Uses a fresh session for each lookup to prevent data leakage.
-    """
-    try:
-        params = {
-            'term': title,
-            'media': 'music',
-            'entity': 'song',
-            'limit': 5
-        }
-        
-        # Use a fresh session for each request to prevent caching/state issues
-        with requests.Session() as session:
-            response = session.get(ITUNES_SEARCH_URL, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-        
-        if data.get('resultCount', 0) == 0:
-            return None
-        
-        # Get best match based on title similarity
-        results = data['results']
-        best_match = None
-        best_score = 0
-        
-        title_words = set(title.lower().split())
-        
-        for result in results:
-            track_name = result.get('trackName', '').lower()
-            artist_name = result.get('artistName', '').lower()
-            
-            # Skip "Various Artists" results unless it's the only option
-            if artist_name == 'various artists':
+    low_confidence_album_terms = [
+        'best of',
+        'greatest hits',
+        'hits',
+        'classics',
+        'essentials',
+        'anthology',
+        'hits collection',
+        'playlist',
+        'karaoke',
+        'tribute',
+        'mix',
+        'remix',
+        'soundtrack',
+    ]
+    best_generic: Optional[Dict[str, Any]] = None
+    best_generic_source = ''
+    best_generic_confidence = 0.0
+
+    total = len(candidates)
+    for idx, candidate in enumerate(candidates, start=1):
+        if candidate.artist:
+            print(f"Looking up metadata for: '{candidate.track}' by '{candidate.artist}' (attempt {idx}/{total})")
+        else:
+            print(f"Looking up metadata for: '{candidate.track}' (attempt {idx}/{total})")
+
+        for source_name, lookup in lookup_chain:
+            try:
+                result = lookup(candidate.track, candidate.artist, candidate.query)
+            except Exception as exc:
+                print(f"? {source_name} lookup failed: {exc}")
                 continue
-            
-            # Calculate similarity score
-            track_words = set(track_name.split())
-            artist_words = set(artist_name.split())
-            all_result_words = track_words | artist_words
-            
-            # Score based on word overlap
-            common_words = title_words & all_result_words
-            score = len(common_words) / len(title_words) if title_words else 0
-            
-            if score > best_score and score > 0.3:  # At least 30% word overlap
-                best_score = score
-                best_match = result
-        
-        if not best_match:
-            # If no good match found, try to find any non-"Various Artists" result
-            for result in results:
-                if result.get('artistName', '').lower() != 'various artists':
-                    best_match = result
-                    break
-            # Last resort: use first result even if it's "Various Artists"
-            if not best_match:
-                best_match = results[0]
-        
-        return {
-            'title': best_match.get('trackName', ''),
-            'artist': best_match.get('artistName', ''),
-            'album': best_match.get('collectionName', ''),
-            'album_artist': best_match.get('artistName', ''),
-            'genre': best_match.get('primaryGenreName', ''),
-            'date': best_match.get('releaseDate', '')[:4] if best_match.get('releaseDate') else '',
-            'track_number': str(best_match.get('trackNumber', '')) if best_match.get('trackNumber') else '',
-            'artwork_url': best_match.get('artworkUrl100', '').replace('100x100bb', '600x600bb') if best_match.get('artworkUrl100') else '',
-        }
-        
-    except Exception as e:
-        print(f"iTunes lookup error: {e}")
+
+            if not result:
+                continue
+
+            metadata, confidence = result
+            if not metadata or not metadata.get('title') or not metadata.get('artist'):
+                continue
+
+            metadata = _sanitize_metadata_result(metadata)
+            metadata['_source'] = source_name
+            metadata['_confidence'] = confidence
+
+            album_title = metadata.get('album') or ''
+            is_generic_album = not album_title or any(term in album_title.lower() for term in low_confidence_album_terms)
+
+            if is_generic_album:
+                if confidence > best_generic_confidence:
+                    best_generic_confidence = confidence
+                    best_generic = metadata
+                    best_generic_source = source_name
+                continue
+
+            print(f"Metadata found via {source_name} (confidence {confidence:.2f})")
+            return metadata
+
+    if best_generic:
+        print(f"Metadata found via {best_generic_source} (generic album, confidence {best_generic_confidence:.2f})")
+        return best_generic
+
+    print('No metadata found from any service')
+    return None
+
+
+def lookup_audiodb(track: str, artist: Optional[str] = None, query: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], float]]:
+    if not track or not artist:
         return None
 
+    params = {
+        's': artist,
+        't': track,
+    }
 
+    with requests.Session() as session:
+        response = session.get('https://www.theaudiodb.com/api/v1/json/2/searchtrack.php', params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+    tracks = data.get('track')
+    if not tracks:
+        return None
+
+    best_entry = tracks[0]
+    track_name = best_entry.get('strTrack') or ''
+    artist_name = best_entry.get('strArtist') or ''
+    album_name = best_entry.get('strAlbum') or ''
+
+    title_score = _string_similarity(track, track_name)
+    artist_score = _string_similarity(artist, artist_name)
+    combined = (title_score * 0.75) + (artist_score * 0.25)
+    if combined < 0.55:
+        return None
+
+    metadata = {
+        'title': track_name,
+        'artist': artist_name,
+        'album': album_name,
+        'album_artist': artist_name,
+        'genre': best_entry.get('strGenre') or '',
+        'date': '',
+        'track_number': str(best_entry.get('intTrackNumber') or ''),
+        'artwork_url': best_entry.get('strTrackThumb') or '',
+    }
+    return metadata, combined
+
+
+def lookup_deezer(track: str, artist: Optional[str] = None, query: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], float]]:
+    if not track:
+        return None
+
+    search_terms = []
+    if track:
+        search_terms.append(f'track:"{track}"')
+    if artist:
+        search_terms.append(f'artist:"{artist}"')
+    search_q = ' '.join(search_terms) if search_terms else (query or track)
+
+    with requests.Session() as session:
+        response = session.get(
+            'https://api.deezer.com/search',
+            params={'q': search_q, 'limit': 10},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    results = data.get('data', [])
+    if not results:
+        return None
+
+    best_entry = None
+    best_score = 0.0
+
+    generic_album_terms = ['greatest hits', 'best of', 'essentials', 'collection']
+
+    for entry in results:
+        track_name = entry.get('title') or entry.get('title_short') or ''
+        artist_info = entry.get('artist') or {}
+        album_info = entry.get('album') or {}
+        artist_name = artist_info.get('name', '')
+        if not track_name or not artist_name:
+            continue
+
+        title_score = _string_similarity(track, track_name)
+        artist_score = _string_similarity(artist, artist_name) if artist else 0.0
+        combined = (title_score * 0.7) + (artist_score * 0.3)
+
+        album_title = album_info.get('title', '') or ''
+        if album_title and any(term in album_title.lower() for term in generic_album_terms):
+            combined -= 0.05
+
+        if combined > best_score:
+            best_score = combined
+            best_entry = entry
+
+    threshold = 0.68 if artist else 0.72
+    if not best_entry or best_score < threshold:
+        return None
+
+    album_info = best_entry.get('album') or {}
+    release_date = album_info.get('release_date') or best_entry.get('release_date') or ''
+    artwork_url = (
+        album_info.get('cover_xl')
+        or album_info.get('cover_big')
+        or album_info.get('cover_medium')
+        or album_info.get('cover')
+        or ''
+    )
+
+    metadata = {
+        'title': best_entry.get('title') or best_entry.get('title_short', ''),
+        'artist': (best_entry.get('artist') or {}).get('name', ''),
+        'album': album_info.get('title', ''),
+        'album_artist': (best_entry.get('artist') or {}).get('name', ''),
+        'genre': '',
+        'date': release_date[:4] if release_date else '',
+        'track_number': str(album_info.get('track_position', '')) if album_info.get('track_position') else '',
+        'artwork_url': artwork_url,
+    }
+    return metadata, best_score
+
+
+def lookup_musicbrainz(track: str, artist: Optional[str] = None, query: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], float]]:
+    if not track:
+        return None
+
+    params = {
+        'fmt': 'json',
+        'limit': 10,
+    }
+
+    if artist:
+        params['query'] = f'recording:"{track}" AND artist:"{artist}"'
+    elif query:
+        params['query'] = query
+    else:
+        params['query'] = f'recording:"{track}"'
+
+    headers = {
+        'User-Agent': 'YoutubeMp3Converter/1.0 (your-email@example.com)',
+    }
+
+    with requests.Session() as session:
+        response = session.get('https://musicbrainz.org/ws/2/recording', params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+    recordings = data.get('recordings', [])
+    if not recordings:
+        return None
+
+    def extract_artist_credit(rec: Dict[str, Any]) -> Tuple[str, List[str]]:
+        display_parts: List[str] = []
+        simple_names: List[str] = []
+        for credit in rec.get('artist-credit', []):
+            if isinstance(credit, dict):
+                name = credit.get('name') or credit.get('artist', {}).get('name', '')
+                if name:
+                    display_parts.append(name)
+                    simple_names.append(name)
+            elif isinstance(credit, str):
+                display_parts.append(credit)
+        display = ''.join(display_parts).strip()
+        return display, simple_names
+
+    best_recording = None
+    best_score = 0.0
+    best_artist_display = ''
+
+    for rec in recordings:
+        title_value = rec.get('title', '')
+        if not title_value:
+            continue
+        artist_display, artist_names = extract_artist_credit(rec)
+        title_score = _string_similarity(track, title_value)
+        if artist:
+            artist_candidates = [artist_display] + artist_names
+            artist_score = max((_string_similarity(artist, cand) for cand in artist_candidates), default=0.0)
+        else:
+            artist_score = 0.0
+        mb_score = (rec.get('score', 0) or 0) / 100
+        combined = (title_score * 0.6) + (artist_score * 0.3) + (mb_score * 0.1)
+
+        if combined > best_score:
+            best_score = combined
+            best_recording = rec
+            best_artist_display = artist_display
+
+    if not best_recording or best_score < (0.58 if artist else 0.62):
+        return None
+
+    recording = best_recording
+    artist_display = best_artist_display or ''
+    if not artist_display and recording.get('artist-credit'):
+        first_credit = recording['artist-credit'][0]
+        if isinstance(first_credit, dict):
+            artist_display = first_credit.get('name', '')
+
+    releases = recording.get('releases') or []
+    chosen_release = None
+    if releases:
+        generic_release_terms = ['best of', 'greatest hits', 'mix', 'remix', 'karaoke', 'tribute', 'collection']
+        best_release_score = float('-inf')
+        best_release_date = '9999-12-31'
+        for rel in releases:
+            score = 0
+            status = (rel.get('status') or '').lower()
+            if status == 'official':
+                score += 3
+            release_group = rel.get('release-group') or {}
+            primary_type = (release_group.get('primary-type') or '').lower()
+            if primary_type == 'album':
+                score += 3
+            elif primary_type == 'single':
+                score += 2
+            elif primary_type == 'ep':
+                score += 1
+            secondary_types = [stype.lower() for stype in (release_group.get('secondary-types') or [])]
+            if 'compilation' in secondary_types:
+                score -= 2
+            title_lower = (rel.get('title') or '').lower()
+            if any(term in title_lower for term in generic_release_terms):
+                score -= 2
+            date_value = rel.get('date') or release_group.get('first-release-date') or '9999-12-31'
+            if date_value != '9999-12-31' and date_value[:4].isdigit():
+                year = int(date_value[:4])
+                if year <= 1995:
+                    score += 1
+                if year <= 1990:
+                    score += 1
+            if score > best_release_score or (score == best_release_score and date_value < best_release_date):
+                best_release_score = score
+                best_release_date = date_value
+                chosen_release = rel
+
+    release_title = chosen_release.get('title', '') if chosen_release else ''
+    release_date = ''
+    if chosen_release:
+        release_date = chosen_release.get('date') or ''
+        if not release_date:
+            release_group = chosen_release.get('release-group') or {}
+            release_date = release_group.get('first-release-date') or ''
+
+    metadata = {
+        'title': recording.get('title', ''),
+        'artist': artist_display,
+        'album': release_title,
+        'album_artist': artist_display,
+        'genre': (recording.get('tags') or [{}])[0].get('name', '') if recording.get('tags') else '',
+        'date': release_date[:4] if release_date else '',
+        'track_number': '',
+        'artwork_url': '',
+    }
+
+    if chosen_release and chosen_release.get('id'):
+        metadata['artwork_url'] = f"https://coverartarchive.org/release/{chosen_release['id']}/front-500"
+
+    if not metadata.get('title') or not metadata.get('artist'):
+        return None
+    return metadata, best_score
+
+
+def lookup_itunes_direct(track: str, artist: Optional[str] = None, query: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], float]]:
+    if not track:
+        return None
+
+    search_term = query or (f"{artist} {track}".strip() if artist else track)
+    params = {
+        'term': search_term,
+        'media': 'music',
+        'entity': 'song',
+        'limit': 10,
+    }
+
+    with requests.Session() as session:
+        response = session.get(ITUNES_SEARCH_URL, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+    results = data.get('results', [])
+    if not results:
+        return None
+
+    best_match = None
+    best_score = 0.0
+
+    for result in results:
+        track_name = result.get('trackName', '')
+        artist_name = result.get('artistName', '')
+        if not track_name:
+            continue
+        if artist and artist_name.lower() == 'various artists':
+            continue
+        title_score = _string_similarity(track, track_name)
+        artist_score = _string_similarity(artist, artist_name) if artist else 0.0
+        combined = (title_score * 0.7) + (artist_score * 0.3)
+        album_title = result.get('collectionName', '') or ''
+        if artist_name.lower() == 'various artists':
+            combined -= 0.05
+        if album_title:
+            album_lower = album_title.lower()
+            if any(term in album_lower for term in ['soundtrack', 'best of', 'greatest hits', 'mix', 'remix', 'karaoke', 'tribute', 'anthology', 'collection', 'classics']):
+                combined -= 0.08
+        if combined > best_score:
+            best_score = combined
+            best_match = result
+
+    if not best_match or best_score < (0.62 if artist else 0.68):
+        return None
+
+    release_date = best_match.get('releaseDate', '')
+    album_artist = best_match.get('collectionArtistName') or best_match.get('artistName', '')
+
+    metadata = {
+        'title': best_match.get('trackName', ''),
+        'artist': best_match.get('artistName', ''),
+        'album': best_match.get('collectionName', ''),
+        'album_artist': album_artist,
+        'genre': best_match.get('primaryGenreName', ''),
+        'date': release_date[:4] if release_date else '',
+        'track_number': str(best_match.get('trackNumber', '')) if best_match.get('trackNumber') else '',
+        'artwork_url': best_match.get('artworkUrl100', '').replace('100x100bb', '600x600bb') if best_match.get('artworkUrl100') else '',
+    }
+    return metadata, best_score
 def lookup_last_fm(title: str) -> Optional[Dict[str, Any]]:
     """
     Look up music metadata using Last.fm API.
@@ -395,30 +758,39 @@ def tag_mp3_with_metadata(mp3_path: Path, video_title: str, uploader: Optional[s
                 return
     
     # Get metadata from online services
-    metadata = get_music_metadata_from_title(video_title)
+    metadata = get_music_metadata_from_title(video_title, uploader, video_id)
     
     if not metadata:
-        print("⚠ No metadata found online, using basic info from video")
+        fallback_title = clean_youtube_title(video_title)
+        fallback_artist = uploader or 'Unknown Artist'
+        print('No metadata found online, using video details')
         metadata = {
-            'title': video_title,
-            'artist': uploader or 'Unknown Artist',
-            'album': '',
-            'album_artist': uploader or 'Unknown Artist',
+            'title': fallback_title,
+            'artist': fallback_artist,
+            'album': fallback_title,
+            'album_artist': fallback_artist,
             'genre': '',
             'date': '',
             'track_number': '',
             'artwork_url': '',
         }
+
+
     else:
-        print(f"✓ Enhanced metadata: {metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}")
-        
-        # If metadata lookup returned "Various Artists" and we have a valid uploader, use uploader instead
-        if (metadata.get('artist', '').lower() == 'various artists' and 
+        source_label = metadata.pop('_source', 'External') or 'External'
+        confidence_value = metadata.pop('_confidence', None)
+        if isinstance(confidence_value, (int, float)):
+            print(f"✓ Enhanced metadata ({source_label}, conf {confidence_value:.2f}): {metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}")
+        else:
+            print(f"✓ Enhanced metadata ({source_label}): {metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}")
+
+        # If metadata lookup returned 'Various Artists' and we have a valid uploader, use uploader instead
+        if (metadata.get('artist', '').lower() == 'various artists' and
             uploader and uploader.lower() != 'various artists'):
-            print(f"⚠ Replacing 'Various Artists' with uploader: {uploader}")
+            print(f"? Replacing 'Various Artists' with uploader: {uploader}")
             metadata['artist'] = uploader
             metadata['album_artist'] = uploader
-            
+
         # Improve album handling for playlist downloads
         if playlist_info and playlist_info.get('playlist_title'):
             playlist_title = playlist_info['playlist_title']
@@ -429,7 +801,7 @@ def tag_mp3_with_metadata(mp3_path: Path, video_title: str, uploader: Optional[s
             # Add playlist track number if available
             if playlist_info.get('playlist_index'):
                 metadata['track_number'] = str(playlist_info['playlist_index'])
-    
+
     # Apply metadata to MP3 file
     try:
         # Load MP3 file and ensure it has tags
@@ -813,7 +1185,9 @@ def main():
                 title = info.get('title', 'Unknown Title')
                 print(f"Video title: {title}")
                 print("Testing metadata lookup...")
-                metadata = get_music_metadata_from_title(title)
+                uploader_name = info.get('uploader')
+                video_id = info.get('id')
+                metadata = get_music_metadata_from_title(title, uploader_name, video_id)
                 if metadata:
                     print("✓ Metadata found:")
                     for key, value in metadata.items():
